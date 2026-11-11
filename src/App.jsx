@@ -1,22 +1,18 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { supabase } from './lib/supabase'
+import { escapeLikeTerm, rankPosts } from './lib/community'
+import PostCard from './components/PostCard'
+import PostDetailPage from './components/PostDetailPage'
+import ProfilePage from './components/ProfilePage'
+import SearchPage from './components/SearchPage'
+import { SiteFooter, StaticPage } from './components/SitePages'
 import './App.css'
 
 const POST_FIELDS = 'id,created_at,updated_at,author_id,community_id,title,type,body,url,image_url,score,comment_count,is_nsfw,is_spoiler,is_pinned'
-const PROFILE_FIELDS = 'id,username,followers_count,following_count,karma'
+const PROFILE_FIELDS = 'id,created_at,username,followers_count,following_count,karma,"Contributions_count"'
 
 function shortName(name = 'reader') {
   return name.replace(/^u\//, '').trim() || 'reader'
-}
-
-function timeAgo(date) {
-  if (!date) return 'just now'
-  const seconds = Math.max(0, Math.floor((Date.now() - new Date(date).getTime()) / 1000))
-  if (seconds < 60) return 'just now'
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`
-  if (seconds < 604800) return `${Math.floor(seconds / 86400)}d ago`
-  return new Date(date).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
 }
 
 function Avatar({ name, small = false }) {
@@ -108,42 +104,11 @@ function CommunityDialog({ onClose, onSubmit, busy, error }) {
   )
 }
 
-function CommentsDialog({ post, comments, profileMap, user, voteMap, onVote, onReply, onDelete, replyTo, setReplyTo, onClose, onSubmit, busy, error, loading }) {
-  const [body, setBody] = useState('')
-  const replyAuthor = replyTo ? profileMap[comments.find((comment) => comment.id === replyTo)?.author_id]?.username : null
-  async function submitComment(event) {
-    event.preventDefault()
-    if (await onSubmit(body, replyTo)) {
-      setBody('')
-      setReplyTo(null)
-    }
-  }
-  return (
-    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <section className="dialog comments-dialog" role="dialog" aria-modal="true" aria-labelledby="comments-title">
-        <div className="dialog-heading"><div><p className="eyebrow">DISCUSSION</p><h2 id="comments-title">{post.title}</h2></div><button className="icon-button" type="button" onClick={onClose} aria-label="Close">×</button></div>
-        {post.body && <p className="comment-post-body">{post.body}</p>}
-        <div className="comments-list">
-          {loading ? <div className="empty-inline">Loading comments…</div> : comments.length === 0 ? <div className="empty-inline"><strong>No comments yet.</strong><span>Be the first to add something helpful.</span></div> : comments.map((comment) => {
-            const author = profileMap[comment.author_id]?.username || 'deleted'
-            const currentVote = voteMap[comment.id] || 0
-            return <article className={`comment-item${comment.parent_id ? ' comment-reply' : ''}`} key={comment.id}><Avatar name={author} small /><div className="comment-content"><div className="comment-meta"><strong>u/{shortName(author)}</strong><span>·</span><span>{timeAgo(comment.created_at)}</span>{comment.updated_at && comment.updated_at !== comment.created_at && <span>edited</span>}</div><p>{comment.is_deleted ? '[comment removed]' : comment.body}</p><div className="comment-actions"><button type="button" className={currentVote === 1 ? 'voted' : ''} onClick={() => onVote(comment.id, 1)} disabled={!user} aria-label="Upvote comment">▲</button><span>{comment.score ?? 0}</span><button type="button" className={currentVote === -1 ? 'voted' : ''} onClick={() => onVote(comment.id, -1)} disabled={!user} aria-label="Downvote comment">▼</button>{!comment.is_deleted && <button type="button" onClick={() => onReply(comment.id)} disabled={!user}>Reply</button>}{user?.id === comment.author_id && !comment.is_deleted && <button type="button" onClick={() => onDelete(comment.id)}>Delete</button>}</div></div></article>
-          })}
-        </div>
-        <form className="comment-form" onSubmit={submitComment}>
-          {user ? <>{replyTo && <div className="replying-to">Replying to u/{shortName(replyAuthor || 'user')} <button type="button" className="text-button" onClick={() => setReplyTo(null)}>Cancel</button></div>}<label className="sr-only" htmlFor="new-comment">Add a comment</label><textarea id="new-comment" rows="3" maxLength="10000" value={body} onChange={(event) => setBody(event.target.value)} placeholder={replyTo ? 'Write a reply…' : 'What are your thoughts?'} required /><div className="comment-form-bottom">{error && <span className="form-error">{error}</span>}<button className="button button-primary" disabled={busy || !body.trim()}>{busy ? 'Commenting…' : replyTo ? 'Reply' : 'Comment'}</button></div></> : <p className="muted">Sign in to join the discussion.</p>}
-        </form>
-      </section>
-    </div>
-  )
-}
-
 function App() {
   const [session, setSession] = useState(null)
   const [posts, setPosts] = useState([])
   const [communities, setCommunities] = useState([])
   const [profiles, setProfiles] = useState([])
-  const [readerBoard, setReaderBoard] = useState([])
   const [memberships, setMemberships] = useState([])
   const [follows, setFollows] = useState([])
   const [postVotes, setPostVotes] = useState({})
@@ -159,18 +124,35 @@ function App() {
   const [communityOpen, setCommunityOpen] = useState(false)
   const [dialogBusy, setDialogBusy] = useState(false)
   const [dialogError, setDialogError] = useState('')
-  const [selectedPost, setSelectedPost] = useState(null)
-  const [comments, setComments] = useState([])
-  const [commentsLoading, setCommentsLoading] = useState(false)
-  const [commentBusy, setCommentBusy] = useState(false)
   const [commentError, setCommentError] = useState('')
-  const [replyTo, setReplyTo] = useState(null)
-  const [selectedCommunity, setSelectedCommunity] = useState(null)
-  const [selectedProfile, setSelectedProfile] = useState(null)
   const [search, setSearch] = useState('')
   const [sort, setSort] = useState('new')
-  const [activeNav, setActiveNav] = useState('home')
   const [mobileMenu, setMobileMenu] = useState(false)
+  const [path, setPath] = useState(window.location.pathname + window.location.search)
+  const [savedPostIds, setSavedPostIds] = useState(() => { try { return JSON.parse(localStorage.getItem('reddit-saved-posts') || '[]') } catch { return [] } })
+  const [searchResults, setSearchResults] = useState({ posts: [], communities: [], profiles: [] })
+  const [searchLoading, setSearchLoading] = useState(false)
+  const [searchError, setSearchError] = useState('')
+  const [detailPost, setDetailPost] = useState(null)
+  const [detailComments, setDetailComments] = useState([])
+  const [detailLoading, setDetailLoading] = useState(false)
+  const [profilePage, setProfilePage] = useState(null)
+  const [profilePosts, setProfilePosts] = useState([])
+  const [profileComments, setProfileComments] = useState([])
+  const [profileLoading, setProfileLoading] = useState(false)
+  const [routePosts, setRoutePosts] = useState(null)
+  const [routePostsLoading, setRoutePostsLoading] = useState(false)
+
+  const navigate = useCallback((to) => { history.pushState({}, '', to); setPath(to); window.scrollTo(0, 0) }, [])
+  useEffect(() => { const pop = () => setPath(location.pathname + location.search); addEventListener('popstate', pop); return () => removeEventListener('popstate', pop) }, [])
+  useEffect(() => { localStorage.setItem('reddit-saved-posts', JSON.stringify(savedPostIds)) }, [savedPostIds])
+  const route = useMemo(() => {
+    const url = new URL(path, location.origin)
+    const parts = url.pathname.split('/').filter(Boolean).map((part) => decodeURIComponent(part))
+    return { url, parts }
+  }, [path])
+  const toggleSave = (postId) => setSavedPostIds((ids) => ids.includes(postId) ? ids.filter((id) => id !== postId) : [...ids, postId])
+  const sharePost = async (post) => { const link = `${location.origin}/comments/${encodeURIComponent(post.id)}`; try { await navigator.clipboard.writeText(link); notify('Link copied.') } catch { notify(link) } }
 
   const profileMap = useMemo(() => Object.fromEntries(profiles.map((profile) => [profile.id, profile])), [profiles])
   const communityMap = useMemo(() => Object.fromEntries(communities.map((community) => [community.id, community])), [communities])
@@ -179,24 +161,22 @@ function App() {
 
   const loadData = useCallback(async (currentUserId = null) => {
     if (!supabase) {
-      setDataError('Add VITE_SUPABASE_URL and VITE_SUPABASE_PUBLISHABLE_KEY to .env.local to connect this app.')
+      setDataError(import.meta.env.PROD ? 'This Vercel build has no Supabase settings. Add VITE_SUPABASE_URL and VITE_SUPABASE_PUBLISHABLE_KEY to the Vercel project, then redeploy.' : 'Add VITE_SUPABASE_URL and VITE_SUPABASE_PUBLISHABLE_KEY to .env.local to connect this app.')
       setLoading(false)
       return
     }
     setLoading(true)
     setDataError('')
-    const [postsResult, communitiesResult, profilesResult, booksResult] = await Promise.all([
+    const [postsResult, communitiesResult, profilesResult] = await Promise.all([
       supabase.from('posts').select(POST_FIELDS).order('created_at', { ascending: false }).limit(50),
       supabase.from('communities').select('id,created_at,name,description,creator_id,icon_url,banner_url,member_count').order('member_count', { ascending: false }).limit(30),
       supabase.from('profiles').select(PROFILE_FIELDS).order('karma', { ascending: false }).limit(50),
-      supabase.from('books').select('id,username,karma,account_age,contributions,followers,is_read').order('karma', { ascending: false }).limit(8),
     ])
-    const firstError = postsResult.error || communitiesResult.error || profilesResult.error || booksResult.error
+    const firstError = postsResult.error || communitiesResult.error || profilesResult.error
     if (firstError) setDataError(firstError.message)
     setPosts(postsResult.data || [])
     setCommunities(communitiesResult.data || [])
     setProfiles(profilesResult.data || [])
-    setReaderBoard(booksResult.data || [])
 
     if (currentUserId) {
       const [membershipResult, followResult, voteResult, commentVoteResult] = await Promise.all([
@@ -224,7 +204,7 @@ function App() {
 
   useEffect(() => {
     if (!supabase) {
-      void loadData()
+      queueMicrotask(() => loadData())
       return undefined
     }
     let active = true
@@ -243,21 +223,60 @@ function App() {
     }
   }, [loadData])
 
-  const visiblePosts = useMemo(() => {
-    const normalizedSearch = search.trim().toLowerCase()
-    let filtered = posts.filter((post) => {
-      if (selectedCommunity && post.community_id !== selectedCommunity.id) return false
-      if (activeNav === 'popular' && !selectedCommunity) { /* sorted below */ }
-      if (normalizedSearch) {
-        const communityName = communityMap[post.community_id]?.name || ''
-        const authorName = profileMap[post.author_id]?.username || ''
-        return `${post.title} ${post.body || ''} ${communityName} ${authorName}`.toLowerCase().includes(normalizedSearch)
-      }
-      return true
+  useEffect(() => {
+    if (route.parts[0] !== 'search') return
+    const term = route.url.searchParams.get('q')?.trim() || ''
+    let active = true
+    if (!term || !supabase) { queueMicrotask(() => { if (active) { setSearchResults({ posts: [], communities: [], profiles: [] }); setSearchLoading(false) } }); return () => { active = false } }
+    queueMicrotask(() => { if (active) { setSearchLoading(true); setSearchError('') } })
+    const pattern = `%${escapeLikeTerm(term)}%`
+    Promise.all([
+      supabase.from('posts').select(POST_FIELDS).ilike('title', pattern).order('created_at', { ascending: false }).limit(50),
+      supabase.from('posts').select(POST_FIELDS).ilike('body', pattern).order('created_at', { ascending: false }).limit(50),
+      supabase.from('posts').select(POST_FIELDS).ilike('url', pattern).order('created_at', { ascending: false }).limit(50),
+      supabase.from('communities').select('id,created_at,name,description,creator_id,icon_url,banner_url,member_count').ilike('name', pattern).limit(30),
+      supabase.from('profiles').select(PROFILE_FIELDS).ilike('username', pattern).limit(30),
+    ]).then(([p, b, l, c, u]) => { if (!active) return; const err = p.error || b.error || l.error || c.error || u.error; const merged = [...(p.data || []), ...(b.data || []), ...(l.data || [])]; setSearchError(err?.message || ''); setSearchResults({ posts: [...new Map(merged.map((post) => [post.id, post])).values()], communities: c.data || [], profiles: u.data || [] }); setSearchLoading(false) })
+    return () => { active = false }
+  }, [path, route, route.parts])
+
+  useEffect(() => {
+    if (route.parts[0] !== 'comments' || !route.parts[1] || !supabase) return undefined
+    let active = true; queueMicrotask(() => { if (active) { setDetailLoading(true); setDetailPost(null); setDetailComments([]) } })
+    Promise.all([
+      supabase.from('posts').select(POST_FIELDS).eq('id', route.parts[1]).maybeSingle(),
+      supabase.from('comments').select('id,created_at,updated_at,post_id,author_id,parent_id,body,score,is_deleted').eq('post_id', route.parts[1]).order('created_at', { ascending: true }),
+    ]).then(([p, c]) => { if (!active) return; setDetailPost(p.data || null); setDetailComments(c.data || []); setDetailLoading(false); if (p.error || c.error) setCommentError((p.error || c.error).message) })
+    return () => { active = false }
+  }, [path, route])
+
+  useEffect(() => {
+    const type = route.parts[0]
+    if (!supabase || !['r', 'saved'].includes(type)) { queueMicrotask(() => setRoutePosts(null)); return undefined }
+    let active = true
+    queueMicrotask(() => { if (active) { setRoutePostsLoading(true); setRoutePosts([]) } })
+    if (type === 'saved') {
+      if (!savedPostIds.length) { queueMicrotask(() => { if (active) setRoutePostsLoading(false) }); return () => { active = false } }
+      supabase.from('posts').select(POST_FIELDS).in('id', savedPostIds).order('created_at', { ascending: false }).then(({ data, error }) => { if (!active) return; setRoutePosts(data || []); setRoutePostsLoading(false); if (error) setActionError(error.message) })
+    } else {
+      const community = communities.find((item) => item.name.toLowerCase() === route.parts[1]?.toLowerCase())
+      if (!community) { if (!loading) queueMicrotask(() => { if (active) setRoutePostsLoading(false) }) }
+      else supabase.from('posts').select(POST_FIELDS).eq('community_id', community.id).order('created_at', { ascending: false }).limit(50).then(({ data, error }) => { if (!active) return; setRoutePosts(data || []); setRoutePostsLoading(false); if (error) setActionError(error.message) })
+    }
+    return () => { active = false }
+  }, [path, route, communities, savedPostIds, loading])
+
+  useEffect(() => {
+    if (route.parts[0] !== 'u' || !route.parts[1] || !supabase) return undefined
+    let active = true; queueMicrotask(() => { if (active) { setProfileLoading(true); setProfilePage(null) } })
+    supabase.from('profiles').select(PROFILE_FIELDS).ilike('username', route.parts[1]).maybeSingle().then(async ({ data, error }) => {
+      if (!active) return
+      if (error || !data) { setProfileLoading(false); return }
+      const [p, c] = await Promise.all([supabase.from('posts').select(POST_FIELDS).eq('author_id', data.id).order('created_at', { ascending: false }).limit(50), supabase.from('comments').select('id,created_at,post_id,body,is_deleted').eq('author_id', data.id).order('created_at', { ascending: false }).limit(50)])
+      if (!active) return; setProfilePage(data); setProfilePosts(p.data || []); setProfileComments(c.data || []); setProfileLoading(false)
     })
-    if (sort === 'top' || activeNav === 'popular') filtered = [...filtered].sort((a, b) => (b.score || 0) - (a.score || 0))
-    return filtered
-  }, [posts, search, sort, activeNav, selectedCommunity, communityMap, profileMap])
+    return () => { active = false }
+  }, [path, route])
 
   const notify = (message) => {
     setNotice(message)
@@ -333,8 +352,6 @@ function App() {
     setDialogBusy(false)
     if (error) { setDialogError(error.message); return }
     setComposeOpen(false)
-    setSelectedCommunity(null)
-    setActiveNav('home')
     notify('Your post is live.')
     await loadData(user.id)
   }
@@ -384,31 +401,19 @@ function App() {
     if (result.error) { setActionError(result.error.message); return }
     setPostVotes((current) => ({ ...current, [post.id]: next }))
     setPosts((current) => current.map((item) => item.id === post.id ? { ...item, score: (item.score || 0) + next - previous } : item))
-  }
-
-  async function openComments(post) {
-    setSelectedPost(post)
-    setComments([])
-    setCommentError('')
-    setReplyTo(null)
-    setCommentsLoading(true)
-    if (supabase) {
-      const { data, error } = await supabase.from('comments').select('id,created_at,updated_at,post_id,author_id,parent_id,body,score,is_deleted').eq('post_id', post.id).order('created_at', { ascending: true })
-      if (error) setCommentError(error.message)
-      else setComments(data || [])
-    }
-    setCommentsLoading(false)
+    setDetailPost((current) => current?.id === post.id ? { ...current, score: (current.score || 0) + next - previous } : current)
   }
 
   async function createComment(body, parentId = null) {
-    if (!requireUser() || !supabase || !selectedPost) return false
-    setCommentBusy(true)
+    const activePost = detailPost
+    if (!requireUser() || !supabase || !activePost) return false
     setCommentError('')
-    const { error } = await supabase.from('comments').insert({ post_id: selectedPost.id, author_id: user.id, parent_id: parentId, body: body.trim() })
-    setCommentBusy(false)
+    const { error } = await supabase.from('comments').insert({ post_id: activePost.id, author_id: user.id, parent_id: parentId, body: body.trim() })
     if (error) { setCommentError(error.message); return false }
     notify('Comment added.')
-    await openComments(selectedPost)
+    const { data: refreshedComments } = await supabase.from('comments').select('id,created_at,updated_at,post_id,author_id,parent_id,body,score,is_deleted').eq('post_id', activePost.id).order('created_at', { ascending: true })
+    setDetailComments(refreshedComments || [])
+    setDetailPost((current) => current?.id === activePost.id ? { ...current, comment_count: (current.comment_count || 0) + 1 } : current)
     await loadData(user.id)
     return true
   }
@@ -417,7 +422,7 @@ function App() {
     if (!user || !supabase) return
     const { error } = await supabase.from('comments').update({ is_deleted: true, updated_at: new Date().toISOString() }).eq('id', commentId).eq('author_id', user.id)
     if (error) { setCommentError(error.message); return }
-    setComments((current) => current.map((comment) => comment.id === commentId ? { ...comment, is_deleted: true } : comment))
+    setDetailComments((current) => current.map((comment) => comment.id === commentId ? { ...comment, is_deleted: true } : comment))
     notify('Comment removed.')
   }
 
@@ -450,109 +455,34 @@ function App() {
       : await supabase.from('comment_votes').delete().eq('user_id', user.id).eq('comment_id', commentId)
     if (result.error) { setCommentError(result.error.message); return }
     setCommentVotes((current) => ({ ...current, [commentId]: next }))
-    setComments((current) => current.map((comment) => comment.id === commentId ? { ...comment, score: (comment.score || 0) + next - previous } : comment))
+    setDetailComments((current) => current.map((comment) => comment.id === commentId ? { ...comment, score: (comment.score || 0) + next - previous } : comment))
   }
-
-  function selectCommunity(community) {
-    setSelectedCommunity(community)
-    setSelectedProfile(null)
-    setActiveNav('home')
-    setMobileMenu(false)
-  }
-
-  const topCommunities = communities.slice(0, 6)
-  const myCommunities = communities.filter((community) => memberships.includes(community.id))
-  const topProfiles = profiles.filter((profile) => profile.id !== user?.id).slice(0, 5)
 
   return (
     <div className="app-shell">
       <header className="topbar">
         <div className="topbar-inner">
           <button className="mobile-menu-button icon-button" type="button" onClick={() => setMobileMenu((open) => !open)} aria-label="Toggle navigation">☰</button>
-          <button className="brand" type="button" onClick={() => { setSelectedCommunity(null); setSelectedProfile(null); setActiveNav('home') }} aria-label="reddit home"><span className="brand-mark">r</span><span>reddit</span></button>
-          <div className="search-wrap"><span className="search-glyph" aria-hidden="true">⌕</span><input aria-label="Search posts and communities" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search Reddit" /></div>
+          <button className="brand" type="button" onClick={() => navigate('/')} aria-label="reddit home"><span className="brand-mark">r</span><span>reddit</span></button>
+          <form className="search-wrap" onSubmit={(event) => { event.preventDefault(); navigate(`/search?q=${encodeURIComponent(search.trim())}`) }}><span className="search-glyph" aria-hidden="true">⌕</span><input aria-label="Search posts and communities" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search Reddit" /></form>
           <div className="topbar-actions">
             {user ? <><button className="button button-primary create-top" type="button" onClick={() => { setDialogError(''); setComposeOpen(true) }}><span>＋</span> Create</button><button className="account-button" type="button" onClick={handleSignOut} title="Sign out"><Avatar name={ownProfile?.username || user.email} small /><span className="account-name">{ownProfile?.username || user.email?.split('@')[0] || 'Account'}</span><span aria-hidden="true">⌄</span></button></> : <><button className="button button-quiet login-top" type="button" onClick={() => { setAuthError(''); setAuthMode('signin') }}>Log in</button><button className="button button-primary" type="button" onClick={() => { setAuthError(''); setAuthMode('signup') }}>Sign up</button></>}
           </div>
         </div>
       </header>
 
-      <div className="layout">
-        <aside className={`left-rail${mobileMenu ? ' is-open' : ''}`}>
-          <nav className="primary-nav" aria-label="Main navigation">
-            <button className={activeNav === 'home' && !selectedCommunity ? 'nav-item active' : 'nav-item'} onClick={() => { setSelectedCommunity(null); setSelectedProfile(null); setActiveNav('home'); setSort('new'); setMobileMenu(false) }}><span className="nav-icon">⌂</span> Home</button>
-            <button className={activeNav === 'popular' ? 'nav-item active' : 'nav-item'} onClick={() => { setSelectedCommunity(null); setSelectedProfile(null); setActiveNav('popular'); setSort('top'); setMobileMenu(false) }}><span className="nav-icon">↗</span> Popular</button>
-            <button className="nav-item" onClick={() => { setCommunityOpen(true); setDialogError(''); setMobileMenu(false) }}><span className="nav-icon">＋</span> Create a community</button>
-          </nav>
-          <div className="rail-rule" />
-          <div className="rail-heading">YOUR COMMUNITIES <span>{myCommunities.length || ''}</span></div>
-          {myCommunities.length ? <div className="community-nav">{myCommunities.map((community) => <button key={community.id} className="community-nav-item" onClick={() => selectCommunity(community)}><span className="community-badge">{community.name.slice(0, 1).toUpperCase()}</span><span>r/{community.name}</span></button>)}</div> : <p className="rail-empty">Join a community to build your home feed.</p>}
-          <div className="rail-rule" />
-          <div className="rail-heading">EXPLORE</div>
-          <div className="community-nav">{topCommunities.map((community) => <button key={community.id} className="community-nav-item" onClick={() => selectCommunity(community)}><span className="community-badge">{community.name.slice(0, 1).toUpperCase()}</span><span>r/{community.name}</span></button>)}</div>
-          {communities.length === 0 && <p className="rail-empty">Communities will show up here.</p>}
-          <div className="left-rail-footer"><span>About</span><span>Rules</span><span>Privacy</span><small>© 2026 Reddit, Inc.</small></div>
-        </aside>
-
-        <main className="feed-column">
-          <div className="feed-heading">
-            <div><p className="eyebrow">{selectedCommunity ? 'COMMUNITY' : activeNav === 'popular' ? 'TRENDING' : 'YOUR FRONT PAGE'}</p><h1>{selectedCommunity ? `r/${selectedCommunity.name}` : activeNav === 'popular' ? 'Popular posts' : 'Home'}</h1></div>
-            {selectedCommunity && user && <button className={`button ${memberships.includes(selectedCommunity.id) ? 'button-quiet' : 'button-primary'}`} onClick={() => toggleMembership(selectedCommunity)}>{memberships.includes(selectedCommunity.id) ? 'Joined' : 'Join'}</button>}
-          </div>
-
-          {dataError && <div className="notice notice-error" role="alert"><strong>Can’t load live data</strong><span>{dataError}</span><button className="text-button" onClick={() => loadData(user?.id || null)}>Try again</button></div>}
-          {!dataError && !loading && posts.length === 0 && <div className="notice notice-info"><strong>No posts appeared.</strong><span>This can mean the feed is empty or Supabase Row Level Security policies are still blocking reads. Check the project’s Policies page if you expect existing data.</span></div>}
-          {actionError && <div className="notice notice-error action-notice" role="alert"><span>{actionError}</span><button className="icon-button" onClick={() => setActionError('')} aria-label="Dismiss">×</button></div>}
-
-          <button className="composer-prompt" type="button" onClick={() => { if (requireUser()) { setDialogError(''); setComposeOpen(true) } }}>
-            <Avatar name={ownProfile?.username || user?.email || 'you'} />
-            <span>Share something with the community</span>
-            <span className="composer-image" aria-hidden="true">▧</span>
-          </button>
-
-          <div className="sort-bar"><span>FEED</span><div className="sort-options"><button className={sort === 'new' && activeNav !== 'popular' ? 'sort-active' : ''} onClick={() => { setSort('new'); setActiveNav('home') }}>◷ New</button><button className={sort === 'top' || activeNav === 'popular' ? 'sort-active' : ''} onClick={() => { setSort('top'); setActiveNav('popular') }}>↗ Top</button></div></div>
-
-          <section className="post-list" aria-label="Posts">
-            {loading ? <div className="loading-card"><span className="spinner" />Loading your feed…</div> : visiblePosts.length === 0 ? <div className="empty-state"><div className="empty-illustration">✳</div><h2>{search ? 'No matches found' : selectedCommunity ? `Nothing in r/${selectedCommunity.name} yet` : 'Your feed is waiting'}</h2><p>{search ? 'Try a different search.' : 'Start a conversation, or join a community to find your people.'}</p><div className="empty-actions"><button className="button button-primary" onClick={() => { if (requireUser()) { setDialogError(''); setComposeOpen(true) } }}>Create a post</button><button className="button button-quiet" onClick={() => setCommunityOpen(true)}>Create community</button></div></div> : visiblePosts.map((post) => {
-              const community = communityMap[post.community_id]
-              const author = profileMap[post.author_id]
-              const currentVote = postVotes[post.id] || 0
-              return <article className="post-card" key={post.id}>
-                <div className="vote-rail"><button className={`vote-button${currentVote === 1 ? ' voted' : ''}`} type="button" disabled={!user} onClick={() => togglePostVote(post, 1)} aria-label="Upvote post" title={user ? 'Upvote' : 'Sign in to vote'}>▲</button><span className="vote-score">{post.score ?? 0}</span><button className={`vote-button downvote${currentVote === -1 ? ' voted' : ''}`} type="button" disabled={!user} onClick={() => togglePostVote(post, -1)} aria-label="Downvote post" title={user ? 'Downvote' : 'Sign in to vote'}>▼</button></div>
-                <div className="post-main">
-                  <div className="post-meta"><button className="post-community" type="button" onClick={() => community && selectCommunity(community)}><span className="community-dot">{community?.name?.slice(0, 1).toUpperCase() || 'r'}</span>{community ? `r/${community.name}` : 'r/community'}</button><span>·</span><span>Posted by</span><button className="author-link" type="button" onClick={() => author && setSelectedProfile(author)}>u/{shortName(author?.username || 'unknown')}</button><span>{timeAgo(post.created_at)}</span>{post.updated_at && post.updated_at !== post.created_at && <span>· edited</span>}{post.is_pinned && <span className="pill pill-pinned">Pinned</span>}</div>
-                  <button className="post-title-button" type="button" onClick={() => openComments(post)}><h2 className="post-title">{post.is_spoiler && <span className="pill pill-spoiler">Spoiler</span>}{post.is_nsfw && <span className="pill pill-nsfw">18+</span>}{post.title}</h2></button>
-                  {post.type === 'link' && post.url && <a className="post-link" href={post.url} target="_blank" rel="noreferrer">↗ {post.url.replace(/^https?:\/\//, '').split('/')[0]}</a>}
-                  {post.type === 'image' && (post.image_url || post.url) && <img className="post-image" src={post.image_url || post.url} alt="Post attachment" loading="lazy" />}
-                  {post.body && <p className="post-body">{post.body}</p>}
-                  <div className="post-actions"><button type="button" onClick={() => openComments(post)}><span>▤</span>{post.comment_count ?? 0} comments</button><button type="button" onClick={() => navigator.clipboard?.writeText(window.location.href).then(() => notify('Link copied.')).catch(() => notify('Could not copy link.'))}><span>↗</span>Share</button>{user?.id === post.author_id && <><button type="button" onClick={() => editPost(post)}>Edit</button><button type="button" onClick={() => deletePost(post)}>Delete</button></>}</div>
-                </div>
-              </article>
-            })}
-          </section>
-        </main>
-
-        <aside className="right-rail">
-          {selectedCommunity ? <section className="side-card community-about"><div className="community-banner"><span className="community-badge community-badge-large">{selectedCommunity.name.slice(0, 1).toUpperCase()}</span></div><div className="side-card-content"><p className="eyebrow">COMMUNITY</p><h2>r/{selectedCommunity.name}</h2><p className="side-description">{selectedCommunity.description || 'A community for sharing and discussion.'}</p><div className="community-stats"><span><strong>{selectedCommunity.member_count ?? 0}</strong> members</span><span><strong>{posts.filter((post) => post.community_id === selectedCommunity.id).length}</strong> posts shown</span></div><button className={`button button-full ${memberships.includes(selectedCommunity.id) ? 'button-quiet' : 'button-primary'}`} onClick={() => toggleMembership(selectedCommunity)}>{memberships.includes(selectedCommunity.id) ? 'Joined' : 'Join community'}</button><button className="button button-full button-quiet side-create-post" onClick={() => { if (requireUser()) { setDialogError(''); setComposeOpen(true) } }}>Create a post</button></div></section> : <section className="welcome-card"><div className="welcome-art"><span className="welcome-spark spark-one">✦</span><span className="welcome-orbit">r</span><span className="welcome-spark spark-two">✳</span><span className="welcome-dot">●</span></div><div className="welcome-copy"><p className="eyebrow">FIND YOUR PEOPLE</p><h2>Good things happen when people talk.</h2><p>Follow the conversations you care about.</p>{!user && <button className="button button-primary button-full" onClick={() => { setAuthError(''); setAuthMode('signup') }}>Join Reddit</button>}</div></section>}
-
-          <section className="side-card"><div className="side-card-heading"><h2>Communities to explore</h2><button className="text-button" onClick={() => setCommunityOpen(true)}>＋ Create</button></div>{topCommunities.length ? <div className="side-community-list">{topCommunities.map((community) => <div className="side-community" key={community.id}><button className="community-identity" onClick={() => selectCommunity(community)}><span className="community-badge">{community.name.slice(0, 1).toUpperCase()}</span><span><strong>r/{community.name}</strong><small>{community.member_count ?? 0} members</small></span></button><button className={memberships.includes(community.id) ? 'mini-button joined' : 'mini-button'} onClick={() => toggleMembership(community)}>{memberships.includes(community.id) ? 'Joined' : 'Join'}</button></div>)}</div> : <div className="side-empty"><span className="empty-mini-icon">⌂</span><p>No communities yet</p><button className="text-button" onClick={() => setCommunityOpen(true)}>Create the first one</button></div>}</section>
-
-          {topProfiles.length > 0 && <section className="side-card"><div className="side-card-heading"><h2>People to follow</h2><span className="side-heading-icon">♙</span></div><div className="side-community-list">{topProfiles.map((profile) => <div className="side-community" key={profile.id}><button className="community-identity" onClick={() => setSelectedProfile(profile)}><Avatar name={profile.username} small /><span><strong>u/{shortName(profile.username)}</strong><small>{profile.karma ?? 0} karma</small></span></button><button className={follows.includes(profile.id) ? 'mini-button joined' : 'mini-button'} onClick={() => toggleFollow(profile)}>{follows.includes(profile.id) ? 'Following' : 'Follow'}</button></div>)}</div></section>}
-
-          <section className="side-card"><div className="side-card-heading"><h2>Books & reader stats</h2><span className="side-heading-icon">▤</span></div>{readerBoard.length ? <div className="side-community-list">{readerBoard.map((entry) => <div className="reader-entry" key={entry.id}><div className="reader-entry-title"><strong>{entry.username}</strong><span className={`reader-status${entry.is_read ? ' is-read' : ''}`}>{entry.is_read ? 'Read' : 'Unread'}</span></div><div className="reader-entry-stats"><span>{entry.karma ?? 0} karma</span><span>{entry.contributions ?? 0} contributions</span><span>{entry.followers ?? 0} followers</span><span>{entry.account_age ?? 0} days here</span></div></div>)}</div> : <div className="side-empty"><span className="empty-mini-icon">▤</span><p>No reader stats yet</p><small>Records from the existing books table will show here.</small></div>}</section>
-
-          <section className="side-card profile-card"><div className="side-card-heading"><h2>Your corner</h2><span className="side-heading-icon">✦</span></div>{user ? <div className="own-profile"><Avatar name={ownProfile?.username || user.email} /><div><strong>u/{shortName(ownProfile?.username || user.email?.split('@')[0])}</strong><small>{ownProfile?.karma ?? 0} karma</small></div><div className="own-stats"><span><strong>{ownProfile?.followers_count ?? 0}</strong> followers</span><span><strong>{ownProfile?.following_count ?? 0}</strong> following</span></div></div> : <div className="side-empty"><p>Sign in to manage your communities, follow people, and save your place.</p><button className="text-button" onClick={() => { setAuthError(''); setAuthMode('signin') }}>Log in</button></div>}</section>
-
-          <footer className="right-footer"><a href="#about" onClick={(event) => event.preventDefault()}>About</a><a href="#content-policy" onClick={(event) => event.preventDefault()}>Content policy</a><a href="#privacy" onClick={(event) => event.preventDefault()}>Privacy</a><span>© 2026 Reddit-inspired community</span></footer>
-        </aside>
-      </div>
-
+      <div className="layout"><aside className={`left-rail${mobileMenu ? ' is-open' : ''}`}><nav className="primary-nav" aria-label="Main navigation"><button className="nav-item" onClick={() => navigate('/')}>⌂ Home</button><button className="nav-item" onClick={() => navigate('/popular')}>↗ Popular</button><button className="nav-item" onClick={() => navigate('/saved')}>▣ Saved</button><button className="nav-item" onClick={() => { setCommunityOpen(true); setDialogError('') }}>＋ Create a community</button></nav><div className="rail-rule"/><div className="rail-heading">YOUR COMMUNITIES</div>{communities.map((c) => <button key={c.id} className="community-nav-item" onClick={() => navigate(`/r/${encodeURIComponent(c.name)}`)}><span className="community-badge">{c.name.slice(0,1).toUpperCase()}</span><span>r/{c.name}</span></button>)}</aside>
+        <main className="feed-column">{dataError && <div className="notice notice-error" role="alert"><strong>Can’t load live data</strong><span>{dataError}</span><button className="text-button" onClick={() => loadData(user?.id || null)}>Try again</button></div>}{actionError && <div className="notice notice-error" role="alert"><span>{actionError}</span><button className="icon-button" onClick={() => setActionError('')} aria-label="Dismiss">×</button></div>}
+          {route.parts[0] === 'search' ? <SearchPage query={route.url.searchParams.get('q') || ''} {...searchResults} loading={searchLoading} error={searchError} communityMap={communityMap} profileMap={profileMap} user={user} postVotes={postVotes} savedPostIds={savedPostIds} onVote={togglePostVote} onSave={toggleSave} onShare={sharePost} onNavigate={navigate} onJoin={toggleMembership} memberships={memberships} onEdit={editPost} onDelete={deletePost}/> : route.parts[0] === 'comments' ? <PostDetailPage post={detailPost} community={communityMap[detailPost?.community_id]} author={profileMap[detailPost?.author_id]} comments={detailComments} profileMap={profileMap} user={user} commentVotes={commentVotes} postVote={postVotes[detailPost?.id] || 0} saved={savedPostIds.includes(detailPost?.id)} loading={detailLoading} error={commentError} onPostVote={togglePostVote} onCommentVote={toggleCommentVote} onSave={toggleSave} onShare={sharePost} onNavigate={navigate} onReply={createComment} onDeleteComment={deleteComment} onEditPost={editPost} onDeletePost={deletePost} onOpenAuth={() => setAuthMode('signin')}/> : route.parts[0] === 'u' ? <ProfilePage profile={profilePage} posts={profilePosts} comments={profileComments} communityMap={communityMap} profileMap={profileMap} user={user} isFollowing={follows.includes(profilePage?.id)} loading={profileLoading} onFollow={toggleFollow} onNavigate={navigate} onVote={togglePostVote} postVotes={postVotes} savedPostIds={savedPostIds} onSave={toggleSave} onShare={sharePost} onEdit={editPost} onDelete={deletePost}/> : ['about','content-policy','privacy','rules','help'].includes(route.parts[0]) ? <StaticPage page={route.parts[0]}/> : <>
+            <div className="feed-heading"><div><p className="eyebrow">{route.parts[0] === 'r' ? 'COMMUNITY' : route.parts[0] === 'saved' ? 'YOUR SAVED POSTS' : route.parts[0] === 'popular' ? 'TRENDING' : 'YOUR FRONT PAGE'}</p><h1>{route.parts[0] === 'r' ? `r/${route.parts[1]}` : route.parts[0] === 'saved' ? 'Saved posts' : route.parts[0] === 'popular' ? 'Popular posts' : 'Home'}</h1></div></div>
+            <button className="composer-prompt" type="button" onClick={() => { if (requireUser()) setComposeOpen(true) }}><Avatar name={ownProfile?.username || user?.email || 'you'}/><span>Share something with the community</span></button><div className="sort-bar"><span>FEED</span><div className="sort-options">{['hot','new','top'].map((s) => <button key={s} className={sort === s ? 'sort-active' : ''} onClick={() => setSort(s)}>{s === 'hot' ? 'Hot' : s === 'new' ? 'New' : 'Top'}</button>)}</div></div>
+            <section className="post-list" aria-label="Posts">{loading || (['r','saved'].includes(route.parts[0]) && routePostsLoading) ? <div className="loading-card"><span className="spinner"/>Loading posts…</div> : rankPosts(routePosts ?? posts, route.parts[0] === 'popular' ? 'top' : sort).map((post) => <PostCard key={post.id} post={post} community={communityMap[post.community_id]} author={profileMap[post.author_id]} user={user} vote={postVotes[post.id] || 0} saved={savedPostIds.includes(post.id)} onVote={togglePostVote} onSave={toggleSave} onShare={sharePost} onNavigate={navigate} onEdit={editPost} onDelete={deletePost}/>)}{!loading && !routePostsLoading && (routePosts ?? posts).length === 0 && <div className="empty-state"><h2>{route.parts[0] === 'saved' ? 'No saved posts' : 'No posts yet'}</h2><p>{route.parts[0] === 'saved' ? 'Save a post and it will appear here.' : 'Start a conversation in your community.'}</p></div>}</section>
+          </>}
+        </main></div><SiteFooter onNavigate={navigate}/>
       {notice && <div className="toast" role="status">{notice}</div>}
       {authMode && <AuthDialog mode={authMode} setMode={(mode) => { setAuthError(''); setAuthMode(mode) }} onClose={() => setAuthMode('')} onSubmit={handleAuth} busy={authBusy} error={authError} />}
-      {composeOpen && <CreatePostDialog communities={communities} initialCommunity={selectedCommunity?.id} onClose={() => setComposeOpen(false)} onSubmit={createPost} busy={dialogBusy} error={dialogError} />}
+      {composeOpen && <CreatePostDialog communities={communities} onClose={() => setComposeOpen(false)} onSubmit={createPost} busy={dialogBusy} error={dialogError} />}
       {communityOpen && <CommunityDialog onClose={() => setCommunityOpen(false)} onSubmit={createCommunity} busy={dialogBusy} error={dialogError} />}
-      {selectedPost && <CommentsDialog post={selectedPost} comments={comments} profileMap={profileMap} user={user} voteMap={commentVotes} onVote={toggleCommentVote} onReply={setReplyTo} onDelete={deleteComment} replyTo={replyTo} setReplyTo={setReplyTo} onClose={() => setSelectedPost(null)} onSubmit={createComment} busy={commentBusy} error={commentError} loading={commentsLoading} />}
-      {selectedProfile && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setSelectedProfile(null)}><section className="dialog profile-dialog" role="dialog" aria-modal="true" aria-labelledby="profile-title"><button className="icon-button dialog-close" onClick={() => setSelectedProfile(null)} aria-label="Close">×</button><div className="profile-dialog-head"><Avatar name={selectedProfile.username} /><div><p className="eyebrow">REDDIT PROFILE</p><h2 id="profile-title">u/{shortName(selectedProfile.username)}</h2></div></div><div className="profile-metrics"><span><strong>{selectedProfile.karma ?? 0}</strong> karma</span><span><strong>{selectedProfile.followers_count ?? 0}</strong> followers</span><span><strong>{selectedProfile.following_count ?? 0}</strong> following</span></div><button className={`button button-full ${follows.includes(selectedProfile.id) ? 'button-quiet' : 'button-primary'}`} onClick={() => toggleFollow(selectedProfile)}>{follows.includes(selectedProfile.id) ? 'Following' : 'Follow'}</button></section></div>}
     </div>
   )
 }
